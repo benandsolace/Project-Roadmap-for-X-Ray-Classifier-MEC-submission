@@ -29,8 +29,8 @@ import copy
 
 #Define data and model directories
 data_dir = '/content/drive/My Drive/DATA_DIR/'
-model_dir = '/content/drive/My Drive/20th_Full_Data/Ben_DenseNet_v2/classification_model_densenet.pt'
-save_folder = '/content/drive/My Drive/20th_Full_Data/Ben_DenseNet_v2/'
+model_dir = '/content/drive/My Drive/Full_Data/DenseNet/classification_model_densenet.pt'
+save_folder = '/content/drive/My Drive/Full_Data/DenseNet/'
 
 # Number of classes in the dataset
 num_classes = 2
@@ -62,7 +62,7 @@ from torch.utils.tensorboard import SummaryWriter
 # define place to hold data
 writer = SummaryWriter(save_folder + 'runs')
 
-tensorboard --logdir=drive/My\ Drive/20th_Full_Data/Ben_DenseNet_v2
+tensorboard --logdir=drive/My\ Drive/Full_Data/DenseNet
 
 ##BUILD DATASET
 
