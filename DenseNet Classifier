@@ -1,0 +1,364 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import sys
+sys.path.append('/content/drive/My Drive/')
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import torchvision
+from torchvision import datasets, models, transforms
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import utils
+
+from PIL import Image, ImageDraw
+from sklearn.metrics import roc_auc_score, roc_curve, auc
+from tqdm import tqdm
+
+from __future__ import print_function
+from __future__ import division
+
+import time
+import copy
+
+##DATA 
+
+#Define data and model directories
+data_dir = '/content/drive/My Drive/DATA_DIR/'
+model_dir = '/content/drive/My Drive/20th_Full_Data/Ben_DenseNet_v2/classification_model_densenet.pt'
+save_folder = '/content/drive/My Drive/20th_Full_Data/Ben_DenseNet_v2/'
+
+# Number of classes in the dataset
+num_classes = 2
+
+# Batch size for training (change depending on how much memory you have)
+batch_size = 8
+
+# Number of epochs to train for
+num_epochs = 20
+
+#input size of images going into model
+input_size = 800
+
+# Flag for feature extracting. When False, we finetune the whole model,
+# when True we only update the reshaped layer params
+feature_extract = False
+
+#number of samples used to train and test network, use 'all' for full data set
+train_image_samples = 'all'
+dev_image_samples = 'all'
+
+##TENSORBOARD
+
+# Load the TensorBoard notebook extension
+%load_ext tensorboard
+
+from torch.utils.tensorboard import SummaryWriter
+
+# define place to hold data
+writer = SummaryWriter(save_folder + 'runs')
+
+tensorboard --logdir=drive/My\ Drive/20th_Full_Data/Ben_DenseNet_v2
+
+##BUILD DATASET
+
+labels_tr = pd.read_csv(data_dir + 'train.csv', na_filter=False)
+labels_dev = pd.read_csv(data_dir + 'dev.csv', na_filter=False)
+
+if train_image_samples != 'all':
+  labels_tr = labels_tr.sample(n=train_image_samples).sort_values(by = 'image_name')
+if dev_image_samples != 'all':
+  labels_dev = labels_dev.sample(n=dev_image_samples).sort_values(by = 'image_name')
+
+img_class_dict_tr = dict(zip(labels_tr.image_name, labels_tr.annotation))
+img_class_dict_dev = dict(zip(labels_dev.image_name, labels_dev.annotation))
+
+class ForeignObjectDataset(object):
+    
+    def __init__(self, datafolder, datatype='train', transform = True, labels_dict={}):
+        self.datafolder = datafolder
+        self.datatype = datatype
+        self.labels_dict = labels_dict
+        self.image_files_list = [s for s in sorted(os.listdir(datafolder)) if s in labels_dict.keys()]
+        self.transform = transform
+        self.annotations = [labels_dict[i] for i in self.image_files_list]
+            
+    def __getitem__(self, idx):
+        # load images 
+        img_name = self.image_files_list[idx]
+        img_path = os.path.join(self.datafolder, img_name)
+        img = Image.open(img_path).convert("RGB")
+        width, height = img.size[0],img.size[1]  
+        
+        # if self.datatype == 'train':
+            
+        if self.labels_dict[img_name] == '':
+            label = 0
+        else:
+            label = 1
+
+        if self.transform is not None:
+            img = self.transform(img)
+            
+        return img, label
+        
+        # if self.datatype == 'dev':
+            
+        #     if self.labels_dict[img_name] == '':
+        #         label = 0
+        #     else:
+        #         label = 1
+            
+        #     if self.transform is not None:
+        #         img = self.transform(img)
+
+        #     return img, label
+
+        
+
+    def __len__(self):
+        return len(self.image_files_list)
+
+# Data augmentation and normalization for training
+# Just normalization for validation
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(15),
+        transforms.Resize((input_size,input_size)),
+        #add the brightness variation 
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'val': transforms.Compose([
+        transforms.Resize((input_size,input_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+}
+
+print("Initializing Datasets and Dataloaders...")
+
+dataset_train = ForeignObjectDataset(datafolder= data_dir + 'train/', datatype='train', transform=data_transforms['train'], labels_dict=img_class_dict_tr)
+dataset_dev = ForeignObjectDataset(datafolder= data_dir + 'dev/', datatype='dev', transform=data_transforms['val'], labels_dict=img_class_dict_dev)
+
+
+data_loader = torch.utils.data.DataLoader(
+    dataset_train, batch_size=8, shuffle= True, num_workers=4,
+    collate_fn=utils.collate_fn)
+
+data_loader_val = torch.utils.data.DataLoader(
+    dataset_dev, batch_size=1, shuffle= False, num_workers=4,
+    collate_fn=utils.collate_fn)
+
+# Create training and validation dataloaders
+dataloaders_dict = {'train': data_loader,
+                    'val': data_loader_val}
+
+# Detect if we have a GPU available
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+## MODEL
+
+def train_model(model, dataloaders, criterion, optimizer, num_epochs):
+    since_start = time.time()
+    best_auc = 0.0
+    best_acc = 0.0
+    best_loss = 10.0
+
+    for epoch in range(num_epochs):
+        since_epoch = time.time()
+        
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
+
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()  # Set model to training mode
+            else:
+                model.eval()   # Set model to evaluate mode
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            preds_prob = torch.empty(0).to(device)
+            gt = torch.empty(0).to(device)
+
+            # Iterate over data.
+            for inputs, labels in dataloaders[phase]:
+                
+                inputs = torch.stack(inputs)
+                labels = list(labels)
+                labels = torch.LongTensor(labels)
+
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+
+                # zero the parameter gradients
+                optimizer.zero_grad()
+
+                # forward
+                # track history if only in train
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs)
+                    outputs_prob = torch.nn.Softmax(dim = 1)(outputs)
+                    loss = criterion(outputs_prob, labels)
+
+                    _, preds = torch.max(outputs_prob, 1)
+                    
+                    preds_prob = torch.cat((preds_prob,outputs_prob[:,1]))
+                    gt_batch = labels.data.float()
+                    gt = torch.cat((gt,labels.data.float()))
+                   
+                    # backward + optimize only if in training phase
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                # statistics
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / len(dataloaders[phase].dataset)
+            epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
+
+            if phase =='train':
+                epoch_loss_tr = epoch_loss
+                epoch_acc_tr = epoch_acc
+                print('TRAIN Loss: {:.4f} Acc: {:.4f}'.format(epoch_loss, epoch_acc))
+            else:
+                fpr, tpr, _ = roc_curve(gt.tolist(), preds_prob.tolist())
+                epoch_auc = auc(fpr, tpr) 
+                print('VAL Loss: {:.4f} Acc: {:.4f} AUC: {:.4f}'.format(epoch_loss, epoch_acc, epoch_auc))
+
+            # Save the model if AUC is better, save best acc and losses as well
+            if phase == 'val' and epoch_auc > best_auc:
+                best_auc = epoch_auc
+                best_epoch = epoch
+                torch.save(model.state_dict(), model_dir)
+            elif phase == 'val' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_epoch_acc = epoch
+            elif phase == 'val' and epoch_loss < best_loss:
+                best_loss = epoch_loss
+                best_epoch_loss = epoch
+
+        #add losses into tensorboard
+        writer.add_scalars('Losses',{'Training':epoch_loss_tr,'Validation':epoch_loss}, epoch)
+        writer.add_scalars('Accuracy',{'Training':epoch_acc_tr,'Validation':epoch_acc}, epoch)
+        writer.add_scalars('AUC',{'Validation':epoch_auc}, epoch)
+        
+        #print time taken 
+        time_epoch = time.time() - since_epoch
+        print('epoch training complete in {:.0f}m {:.0f}s'.format(time_epoch // 60, time_epoch % 60))
+        print()
+
+    time_elapsed = time.time() - since_start
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    print('Best LOSS: {:.4f} on epoch {:.0f}'.format(best_loss,best_epoch_loss))
+    print('Best ACC: {:.4f} on epoch {:.0f}'.format(best_acc,best_epoch_acc))
+    print('Best AUC: {:.4f} on epoch {:.0f}'.format(best_auc,best_epoch))
+
+def _get_model(num_classes,feature_extract):
+    model = models.densenet121(pretrained=True)
+    set_parameter_requires_grad(model, feature_extract)
+    num_ftrs = model.classifier.in_features
+    model.classifier = nn.Linear(num_ftrs, num_classes)
+    return model
+
+def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        for param in model.parameters():
+            param.requires_grad = False
+
+# Get and send the model to GPU
+model_ft = _get_model(num_classes,feature_extract)
+model_ft = model_ft.to(device)
+
+# Gather the parameters to be optimized/updated in this run.
+params_to_update = model_ft.parameters()
+print("Params to learn:")
+if feature_extract:
+    params_to_update = []
+    for name,param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            params_to_update.append(param)
+            print("\t",name)
+else:
+    for name,param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            print("\t",name)
+
+# Observe that all parameters are being optimized
+optimizer_ft = optim.SGD(params_to_update, lr=0.001, momentum=0.9)
+
+# Setup the loss fxn
+criterion = nn.CrossEntropyLoss()
+
+# Train and evaluate
+train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs)
+
+model = _get_model(num_classes,feature_extract)
+model.to(device)
+model.load_state_dict(torch.load(model_dir))
+
+with torch.no_grad():
+  model.eval()
+
+  preds_prob = []
+  labels = []
+  locs = []
+
+  for image, label in tqdm(dataloaders_dict['val']):
+      
+      image = torch.stack(image)
+      image = image.to(device)
+
+      labels.append(label[-1])
+      
+      outputs = model(image)
+      outputs = torch.nn.Softmax(dim = 1)(outputs)
+
+      preds_prob.append(outputs[0][1])
+
+preds_prob=torch.Tensor(preds_prob)
+preds_prob=preds_prob.tolist()
+
+
+## CALCULATING AUC AND ACC
+
+pred = []
+for i in range(len(preds_prob)):
+  if (preds_prob[i] >= .5):
+    pred.append(1)
+  else:
+    pred.append(0)
+
+gt = labels_dev.annotation.astype(bool).astype(float).values
+
+plt.plot(gt, preds_prob,'.', Color = [0,0,0,0.1])
+plt.ylim((0,1))
+
+acc = (pred == gt).mean()
+fpr, tpr, _ = roc_curve(gt, preds_prob)
+roc_auc = auc(fpr, tpr)
+
+fig, ax = plt.subplots(
+    subplot_kw=dict(xlim=[0, 1], ylim=[0, 1], aspect='equal'),
+    figsize=(6, 6)
+)
+ax.plot(fpr, tpr, label=f'ACC: {acc:.03}\nAUC: {roc_auc:.03}')
+_ = ax.legend(loc="lower right")
+_ = ax.set_title('ROC curve')
+ax.grid(linestyle='dashed')
+
+cls_res = pd.DataFrame({'image_name': dataset_dev.image_files_list, 'prediction': preds_prob})
+cls_res.to_csv(save_folder + 'classification.csv', columns=['image_name', 'prediction'], sep=',', index=None)
+print('classification.csv generated.')
